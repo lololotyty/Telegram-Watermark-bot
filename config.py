@@ -1,6 +1,6 @@
 import os
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "6871505238:AAF0DiNwF2n5VmmLE77xwdb2zrZrgECWe24")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7505306936:AAEyz0v9wXq1V2OZrwVne1TsrWFxTBXQNAE")
 WATERMARK = str(os.environ.get("WATERMARK", "...watermark..."))
 FONT_SIZE = int(os.environ.get("FONT_SIZE", 15))
 FONT_NAME = "Space_Age.ttf"  # check tools/fonts
