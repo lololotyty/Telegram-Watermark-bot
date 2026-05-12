@@ -272,7 +272,7 @@ def delete_user_session(user_id):
     except Exception as e:
         logger.error(f"Error deleting session: {e}")
 
-def save_download_progress(user_id, batch_id, videos, current_index, chat_id):
+def save_download_progress(user_id, batch_id, videos, current_index, chat_id, quality='good'):
     """Save download progress to MongoDB"""
     try:
         if db is not None:
@@ -285,12 +285,13 @@ def save_download_progress(user_id, batch_id, videos, current_index, chat_id):
                         "videos": videos,
                         "current_index": current_index,
                         "chat_id": chat_id,
+                        "quality": quality,
                         "updated_at": datetime.utcnow()
                     }
                 },
                 upsert=True
             )
-            logger.info(f"Saved download progress for user {user_id}: {current_index}/{len(videos)}")
+            logger.info(f"Saved download progress for user {user_id}: {current_index}/{len(videos)}, quality: {quality}")
     except Exception as e:
         logger.error(f"Error saving download progress: {e}")
 
@@ -304,7 +305,8 @@ def get_download_progress(user_id):
                     "batch_id": progress["batch_id"],
                     "videos": progress["videos"],
                     "current_index": progress["current_index"],
-                    "chat_id": progress["chat_id"]
+                    "chat_id": progress["chat_id"],
+                    "quality": progress.get("quality", "good")
                 }
     except Exception as e:
         logger.error(f"Error getting download progress: {e}")
@@ -642,15 +644,43 @@ async def batch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ask user what they want
     keyboard = [
         [InlineKeyboardButton("📋 Get Links Only", callback_data=f"links_{batch_id}")],
-        [InlineKeyboardButton("📥 Download & Upload Videos", callback_data=f"download_{batch_id}")]
+        [InlineKeyboardButton("📥 Download & Upload Videos", callback_data=f"quality_{batch_id}")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
         "📚 What would you like?\n\n"
         "📋 Get Links Only - Fast, just video URLs\n"
-        "📥 Download & Upload - Bot downloads and uploads videos to Telegram (slower)\n\n"
+        "📥 Download & Upload - Bot downloads and uploads videos to Telegram\n\n"
         "Choose an option:",
+        reply_markup=reply_markup
+    )
+
+async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle quality selection"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    batch_id = query.data.replace("quality_", "")
+    
+    # Store batch_id for later
+    context.user_data['selected_batch'] = batch_id
+    
+    # Ask for quality preference
+    keyboard = [
+        [InlineKeyboardButton("🔥 Best Quality (Larger files)", callback_data=f"download_best_{batch_id}")],
+        [InlineKeyboardButton("⚡ Good Quality (Balanced)", callback_data=f"download_good_{batch_id}")],
+        [InlineKeyboardButton("💾 Low Quality (Smaller files)", callback_data=f"download_low_{batch_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "🎬 Select Video Quality:\n\n"
+        "🔥 Best Quality - Original quality, larger files\n"
+        "⚡ Good Quality - 720p, balanced size and quality\n"
+        "💾 Low Quality - 480p, smaller files, faster upload\n\n"
+        "Choose quality:",
         reply_markup=reply_markup
     )
 
@@ -786,7 +816,7 @@ async def links_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle download and upload request"""
+    """Handle download and upload request with quality selection"""
     query = update.callback_query
     await query.answer()
     
@@ -797,10 +827,24 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Session expired. Please /login again.")
         return
     
-    batch_id = query.data.replace("download_", "")
+    # Extract quality and batch_id from callback data
+    # Format: download_best_12345 or download_good_12345 or download_low_12345
+    callback_parts = query.data.replace("download_", "").split("_", 1)
+    quality = callback_parts[0] if len(callback_parts) > 1 else "good"
+    batch_id = callback_parts[1] if len(callback_parts) > 1 else callback_parts[0]
+    
+    # Store quality preference
+    context.user_data['video_quality'] = quality
+    
+    quality_text = {
+        'best': '🔥 Best Quality (Original)',
+        'good': '⚡ Good Quality (720p)',
+        'low': '💾 Low Quality (480p)'
+    }.get(quality, '⚡ Good Quality')
     
     await query.edit_message_text(
         f"📥 Starting download and upload process...\n\n"
+        f"Quality: {quality_text}\n"
         f"⏳ Fetching video list..."
     )
     
@@ -872,8 +916,9 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Could not fetch video URLs.")
             return
         
-        # Save download progress to MongoDB
-        save_download_progress(user_id, batch_id, video_list, 0, query.message.chat_id)
+        # Save download progress to MongoDB with quality
+        quality = context.user_data.get('video_quality', 'good')
+        save_download_progress(user_id, batch_id, video_list, 0, query.message.chat_id, quality)
         
         await query.edit_message_text(
             f"✅ Ready to download {len(video_list)} videos!\n\n"
@@ -899,13 +944,32 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
     import tempfile
     import ffmpeg
     from PIL import Image
+    import asyncio
+    
+    logger.info(f"=== Starting download_and_upload_videos for user {user_id} ===")
     
     download_data = get_download_progress(user_id)
     if not download_data:
+        logger.error(f"No download data found for user {user_id}")
         return
     
     videos = download_data['videos']
     chat_id = download_data['chat_id']
+    quality = download_data.get('quality', 'good')
+    
+    logger.info(f"Found {len(videos)} videos to process, starting from index {download_data['current_index']}, quality: {quality}")
+    
+    # Quality settings for yt-dlp
+    quality_formats = {
+        'best': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'good': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best',
+        'low': 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best'
+    }
+    format_option = quality_formats.get(quality, quality_formats['good'])
+    
+    # Progress tracking
+    progress_msg = None
+    last_progress_update = 0
     
     for i in range(download_data['current_index'], len(videos)):
         # Check if user stopped the process
@@ -922,8 +986,8 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
         video_name = video['name'].replace('/', '-').replace('\\', '-').replace(':', '-')
         video_url = video['url']
         
-        # Update current index in MongoDB
-        save_download_progress(user_id, download_data['batch_id'], videos, i, chat_id)
+        # Update current index in MongoDB with quality
+        save_download_progress(user_id, download_data['batch_id'], videos, i, chat_id, quality)
         
         try:
             # Send status
@@ -994,15 +1058,78 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                     )
                     
                 else:
-                    # Download video using yt-dlp
-                    result = subprocess.run(
-                        ['yt-dlp', '-o', raw_output, video_url],
-                        capture_output=True,
+                    # Download video using yt-dlp with progress
+                    logger.info(f"Starting yt-dlp download for: {video_name}")
+                    logger.info(f"Video URL: {video_url}")
+                    
+                    # Create progress file for yt-dlp
+                    progress_file = os.path.join(temp_dir, "progress.txt")
+                    
+                    # Start yt-dlp with progress output and quality selection
+                    process = subprocess.Popen(
+                        [
+                            'yt-dlp',
+                            '-f', format_option,  # Quality format
+                            '-o', raw_output,
+                            '--newline',  # Output progress on new lines
+                            '--no-warnings',
+                            '--concurrent-fragments', '4',  # Download 4 fragments at once
+                            '--buffer-size', '16K',  # Increase buffer
+                            '--http-chunk-size', '10M',  # Download in 10MB chunks
+                            video_url
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
                         text=True,
-                        timeout=1800  # 30 minutes timeout
+                        bufsize=1
                     )
                     
-                    if result.returncode != 0:
+                    # Monitor progress
+                    download_progress = 0
+                    last_update_time = time.time()
+                    
+                    while True:
+                        line = process.stdout.readline()
+                        if not line and process.poll() is not None:
+                            break
+                        
+                        if line:
+                            # Parse progress from yt-dlp output
+                            if '[download]' in line and '%' in line:
+                                try:
+                                    # Extract percentage
+                                    parts = line.split()
+                                    for part in parts:
+                                        if '%' in part:
+                                            percent = float(part.replace('%', ''))
+                                            download_progress = percent
+                                            
+                                            # Update progress every 5 seconds
+                                            current_time = time.time()
+                                            if current_time - last_update_time >= 5:
+                                                progress_bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                                                await status_msg.edit_text(
+                                                    f"📥 Downloading video {i+1}/{len(videos)}\n\n"
+                                                    f"📹 {video_name}\n\n"
+                                                    f"Progress: [{progress_bar}] {percent:.1f}%\n"
+                                                    f"⏳ Please wait..."
+                                                )
+                                                last_update_time = current_time
+                                            break
+                                except:
+                                    pass
+                    
+                    # Wait for process to complete
+                    process.wait()
+                    result_code = process.returncode
+                    
+                    logger.info(f"yt-dlp exit code: {result_code}")
+                    
+                    if result_code != 0:
+                        stderr = process.stderr.read()
+                        logger.warning(f"yt-dlp stderr: {stderr[:500]}")
+                    
+                    if result_code != 0:
                         await status_msg.edit_text(
                             f"❌ Failed to download video {i+1}/{len(videos)}\n\n"
                             f"📹 {video_name}\n\n"
@@ -1247,6 +1374,7 @@ def run_telegram_bot():
     application.add_handler(CommandHandler("resume", resume_download))
     application.add_handler(CallbackQueryHandler(batch_callback, pattern="^batch_"))
     application.add_handler(CallbackQueryHandler(links_callback, pattern="^links_"))
+    application.add_handler(CallbackQueryHandler(quality_callback, pattern="^quality_"))
     application.add_handler(CallbackQueryHandler(download_callback, pattern="^download_"))
     
     # Start the bot
