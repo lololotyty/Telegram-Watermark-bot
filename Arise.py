@@ -1109,117 +1109,185 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                     logger.info(f"Starting yt-dlp download for: {video_name}")
                     logger.info(f"Video URL: {video_url}")
                     
-                    # Start yt-dlp with progress output and quality selection
-                    # For DASH (.mpd) files, we need special handling
-                    
-                    # Determine format based on quality and file type
-                    is_dash = '.mpd' in video_url.lower()
-                    
-                    if is_dash:
-                        # For DASH manifests, use simpler format selection
-                        if quality == 'best':
-                            format_str = 'bv*+ba/b'  # Best video + best audio
-                        elif quality == 'low':
-                            format_str = 'wv*[height<=480]+wa/w[height<=480]/bv*[height<=480]+ba/b[height<=480]'
-                        else:  # good (default)
-                            format_str = 'wv*[height<=720]+wa/w[height<=720]/bv*[height<=720]+ba/b[height<=720]'
-                    else:
-                        # For direct MP4 files, use original format
-                        format_str = format_option
-                    
                     # Get user session for authentication
                     user_session = get_user_session(user_id)
                     
-                    yt_dlp_cmd = [
-                        'yt-dlp',
-                        '-f', format_str,
-                        '-o', raw_output,
-                        '--newline',  # Output progress on new lines
-                        '--no-warnings',
-                        '--concurrent-fragments', '4',  # Download 4 fragments at once
-                        '--buffer-size', '16K',  # Increase buffer
-                        '--http-chunk-size', '10M',  # Download in 10MB chunks
-                        '--merge-output-format', 'mp4',  # Ensure MP4 output
-                        '--no-check-certificates',  # Skip SSL verification if needed
-                    ]
+                    # For DASH manifests, try direct approach first
+                    is_dash = '.mpd' in video_url.lower()
                     
-                    # Add authentication headers if available
-                    if user_session:
-                        yt_dlp_cmd.extend([
-                            '--add-header', f'authorization:Bearer {user_session["token"]}',
-                            '--add-header', f'useremail:{user_session["email"]}'
-                        ])
-                    
-                    # Add common headers
-                    yt_dlp_cmd.extend([
-                        '--add-header', 'User-Agent:Mozilla/5.0 (Linux; Android 16; Pixel 10 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36',
-                        '--add-header', 'Referer:https://localhost/',
-                        '--add-header', 'Origin:https://localhost'
-                    ])
-                    
-                    # Add video URL
-                    yt_dlp_cmd.append(video_url)
-                    
-                    # For DASH (.mpd) files, add external downloader
                     if is_dash:
-                        yt_dlp_cmd.insert(1, '--external-downloader')
-                        yt_dlp_cmd.insert(2, 'ffmpeg')
-                        logger.info(f"Using DASH format: {format_str} with FFmpeg external downloader")
-                    
-                    logger.info(f"yt-dlp command: {' '.join([c if 'Bearer' not in c else 'Bearer ***' for c in yt_dlp_cmd])}")
-                    
-                    process = subprocess.Popen(
-                        yt_dlp_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        bufsize=1
-                    )
-                    
-                    # Monitor progress
-                    download_progress = 0
-                    last_update_time = time.time()
-                    
-                    while True:
-                        line = process.stdout.readline()
-                        if not line and process.poll() is not None:
-                            break
+                        logger.info("DASH manifest detected - trying direct FFmpeg download first")
                         
-                        if line:
-                            # Parse progress from yt-dlp output
-                            if '[download]' in line and '%' in line:
-                                try:
-                                    # Extract percentage
-                                    parts = line.split()
-                                    for part in parts:
-                                        if '%' in part:
-                                            percent = float(part.replace('%', ''))
-                                            download_progress = percent
-                                            
-                                            # Update progress every 5 seconds
-                                            current_time = time.time()
-                                            if current_time - last_update_time >= 5:
-                                                progress_bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
-                                                await status_msg.edit_text(
-                                                    f"📥 Downloading video {i+1}/{len(videos)}\n\n"
-                                                    f"📹 {video_name}\n\n"
-                                                    f"Progress: [{progress_bar}] {percent:.1f}%\n"
-                                                    f"⏳ Please wait..."
-                                                )
-                                                last_update_time = current_time
-                                            break
-                                except:
-                                    pass
+                        # Build FFmpeg command with authentication
+                        ffmpeg_cmd = [
+                            'ffmpeg',
+                            '-user_agent', 'Mozilla/5.0 (Linux; Android 16; Pixel 10 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36',
+                        ]
+                        
+                        # Add authentication headers for FFmpeg
+                        if user_session:
+                            headers_str = f'authorization: Bearer {user_session["token"]}\r\nuseremail: {user_session["email"]}\r\n'
+                            ffmpeg_cmd.extend(['-headers', headers_str])
+                        
+                        ffmpeg_cmd.extend([
+                            '-i', video_url,
+                            '-c', 'copy',
+                            '-bsf:a', 'aac_adtstoasc',  # Fix AAC stream
+                            '-movflags', '+faststart',  # Optimize for streaming
+                            '-y',
+                            raw_output
+                        ])
+                        
+                        logger.info("Trying direct FFmpeg download...")
+                        await status_msg.edit_text(
+                            f"📥 Downloading video {i+1}/{len(videos)}...\n\n"
+                            f"📹 {video_name}\n\n"
+                            f"⏳ Using direct download method..."
+                        )
+                        
+                        # Try FFmpeg first
+                        ffmpeg_process = subprocess.Popen(
+                            ffmpeg_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            bufsize=1
+                        )
+                        
+                        # Monitor FFmpeg progress
+                        last_update_time = time.time()
+                        while True:
+                            line = ffmpeg_process.stderr.readline()
+                            if not line and ffmpeg_process.poll() is not None:
+                                break
+                            
+                            if line and 'time=' in line:
+                                # Update every 5 seconds
+                                current_time = time.time()
+                                if current_time - last_update_time >= 5:
+                                    await status_msg.edit_text(
+                                        f"📥 Downloading video {i+1}/{len(videos)}...\n\n"
+                                        f"📹 {video_name}\n\n"
+                                        f"⏳ Downloading... Please wait..."
+                                    )
+                                    last_update_time = current_time
+                        
+                        ffmpeg_process.wait()
+                        result_code = ffmpeg_process.returncode
+                        
+                        if result_code == 0 and os.path.exists(raw_output):
+                            logger.info("FFmpeg direct download successful!")
+                        else:
+                            logger.warning(f"FFmpeg failed with code {result_code}, trying yt-dlp...")
+                            result_code = 1  # Mark as failed to trigger yt-dlp fallback
+                    else:
+                        result_code = 1  # Not DASH, use yt-dlp
                     
-                    # Wait for process to complete
-                    process.wait()
-                    result_code = process.returncode
-                    stderr_output = process.stderr.read()
-                    
-                    logger.info(f"yt-dlp exit code: {result_code}")
-                    
+                    # If FFmpeg failed or not DASH, try yt-dlp
                     if result_code != 0:
-                        logger.warning(f"yt-dlp stderr: {stderr_output[:500]}")
+                        # Determine format based on quality and file type
+                        if is_dash:
+                            # For DASH manifests, use simpler format selection
+                            if quality == 'best':
+                                format_str = 'bv*+ba/b'  # Best video + best audio
+                            elif quality == 'low':
+                                format_str = 'wv*[height<=480]+wa/w[height<=480]/bv*[height<=480]+ba/b[height<=480]'
+                            else:  # good (default)
+                                format_str = 'wv*[height<=720]+wa/w[height<=720]/bv*[height<=720]+ba/b[height<=720]'
+                        else:
+                            # For direct MP4 files, use original format
+                            format_str = format_option
+                        
+                        yt_dlp_cmd = [
+                            'yt-dlp',
+                            '-f', format_str,
+                            '-o', raw_output,
+                            '--newline',  # Output progress on new lines
+                            '--no-warnings',
+                            '--concurrent-fragments', '4',  # Download 4 fragments at once
+                            '--buffer-size', '16K',  # Increase buffer
+                            '--http-chunk-size', '10M',  # Download in 10MB chunks
+                            '--merge-output-format', 'mp4',  # Ensure MP4 output
+                            '--no-check-certificates',  # Skip SSL verification if needed
+                        ]
+                        
+                        # Add authentication headers if available
+                        if user_session:
+                            yt_dlp_cmd.extend([
+                                '--add-header', f'authorization:Bearer {user_session["token"]}',
+                                '--add-header', f'useremail:{user_session["email"]}'
+                            ])
+                        
+                        # Add common headers
+                        yt_dlp_cmd.extend([
+                            '--add-header', 'User-Agent:Mozilla/5.0 (Linux; Android 16; Pixel 10 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36',
+                            '--add-header', 'Referer:https://localhost/',
+                            '--add-header', 'Origin:https://localhost'
+                        ])
+                        
+                        # Add video URL
+                        yt_dlp_cmd.append(video_url)
+                        
+                        # For DASH (.mpd) files, add external downloader
+                        if is_dash:
+                            yt_dlp_cmd.insert(1, '--external-downloader')
+                            yt_dlp_cmd.insert(2, 'ffmpeg')
+                            logger.info(f"Using DASH format: {format_str} with FFmpeg external downloader")
+                        
+                        logger.info(f"yt-dlp command: {' '.join([c if 'Bearer' not in c else 'Bearer ***' for c in yt_dlp_cmd])}")
+                        
+                        process = subprocess.Popen(
+                            yt_dlp_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            bufsize=1
+                        )
+                        
+                        # Monitor progress
+                        download_progress = 0
+                        last_update_time = time.time()
+                        
+                        while True:
+                            line = process.stdout.readline()
+                            if not line and process.poll() is not None:
+                                break
+                            
+                            if line:
+                                # Parse progress from yt-dlp output
+                                if '[download]' in line and '%' in line:
+                                    try:
+                                        # Extract percentage
+                                        parts = line.split()
+                                        for part in parts:
+                                            if '%' in part:
+                                                percent = float(part.replace('%', ''))
+                                                download_progress = percent
+                                                
+                                                # Update progress every 5 seconds
+                                                current_time = time.time()
+                                                if current_time - last_update_time >= 5:
+                                                    progress_bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                                                    await status_msg.edit_text(
+                                                        f"📥 Downloading video {i+1}/{len(videos)}\n\n"
+                                                        f"📹 {video_name}\n\n"
+                                                        f"Progress: [{progress_bar}] {percent:.1f}%\n"
+                                                        f"⏳ Please wait..."
+                                                    )
+                                                    last_update_time = current_time
+                                                break
+                                    except:
+                                        pass
+                        
+                        # Wait for process to complete
+                        process.wait()
+                        result_code = process.returncode
+                        stderr_output = process.stderr.read()
+                        
+                        logger.info(f"yt-dlp exit code: {result_code}")
+                        
+                        if result_code != 0:
+                            logger.warning(f"yt-dlp stderr: {stderr_output[:500]}")
                         
                         # Try fallback with simpler format for DASH files
                         if is_dash and 'Requested format is not available' in stderr_output:
