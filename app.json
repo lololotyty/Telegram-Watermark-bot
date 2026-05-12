@@ -1,0 +1,30 @@
+{
+  "name": "Arise Medical Academy Bot",
+  "description": "Telegram bot to download and manage Arise Medical Academy lecture videos",
+  "repository": "https://github.com/yourusername/arise-bot",
+  "keywords": ["telegram", "bot", "video", "education", "arise"],
+  "buildpacks": [
+    {
+      "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "env": {
+    "TELEGRAM_BOT_TOKEN": {
+      "description": "Your Telegram Bot Token from @BotFather",
+      "required": true
+    },
+    "MONGODB_URI": {
+      "description": "MongoDB connection string (get free from MongoDB Atlas)",
+      "required": true
+    }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "free"
+    }
+  }
+}
