@@ -7,6 +7,10 @@ import logging
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from dotenv import load_dotenv
+
+# Load environment variables from .env file (for local development)
+load_dotenv()
 
 # Enable logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -433,9 +437,8 @@ async def batch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Send video links in chunks (5 per message to avoid Telegram limits)
         if video_links:
             await query.edit_message_text(
-                f"✅ *Successfully fetched {len(video_links)} videos!*\n\n"
-                f"Sending video links...",
-                parse_mode='Markdown'
+                f"✅ Successfully fetched {len(video_links)} videos!\n\n"
+                f"Sending video links..."
             )
             
             # Send videos in chunks of 5
@@ -444,12 +447,13 @@ async def batch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message = ""
                 
                 for idx, video in enumerate(chunk, start=i+1):
-                    message += f"📹 *{idx}. {video['name']}*\n{video['url']}\n\n"
+                    # Escape special characters to avoid Markdown parsing errors
+                    video_name = video['name'].replace('*', '').replace('_', '').replace('[', '').replace(']', '').replace('`', '')
+                    message += f"📹 {idx}. {video_name}\n{video['url']}\n\n"
                 
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text=message,
-                    parse_mode='Markdown'
+                    text=message
                 )
                 
                 # Small delay to avoid rate limiting
@@ -458,10 +462,9 @@ async def batch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Send summary
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                text=f"✅ *Download Complete!*\n\n"
+                text=f"✅ Download Complete!\n\n"
                      f"Total videos sent: {len(video_links)}\n\n"
-                     f"Use /batches to download from another batch.",
-                parse_mode='Markdown'
+                     f"Use /batches to download from another batch."
             )
         else:
             await query.edit_message_text("❌ Could not fetch video links. Please try again.")
