@@ -275,42 +275,54 @@ def delete_user_session(user_id):
 def save_download_progress(user_id, batch_id, videos, current_index, chat_id, quality='good'):
     """Save download progress to MongoDB"""
     try:
-        if db is not None:
-            db.download_progress.update_one(
-                {"user_id": user_id},
-                {
-                    "$set": {
-                        "user_id": user_id,
-                        "batch_id": batch_id,
-                        "videos": videos,
-                        "current_index": current_index,
-                        "chat_id": chat_id,
-                        "quality": quality,
-                        "updated_at": datetime.utcnow()
-                    }
-                },
-                upsert=True
-            )
-            logger.info(f"Saved download progress for user {user_id}: {current_index}/{len(videos)}, quality: {quality}")
+        if db is None:
+            logger.error("MongoDB not connected - cannot save download progress")
+            return False
+            
+        result = db.download_progress.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "user_id": user_id,
+                    "batch_id": batch_id,
+                    "videos": videos,
+                    "current_index": current_index,
+                    "chat_id": chat_id,
+                    "quality": quality,
+                    "updated_at": datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
+        logger.info(f"Saved download progress for user {user_id}: {current_index}/{len(videos)}, quality: {quality}, matched: {result.matched_count}, modified: {result.modified_count}, upserted: {result.upserted_id}")
+        return True
     except Exception as e:
         logger.error(f"Error saving download progress: {e}")
+        return False
 
 def get_download_progress(user_id):
     """Get download progress from MongoDB"""
     try:
-        if db is not None:
-            progress = db.download_progress.find_one({"user_id": user_id})
-            if progress:
-                return {
-                    "batch_id": progress["batch_id"],
-                    "videos": progress["videos"],
-                    "current_index": progress["current_index"],
-                    "chat_id": progress["chat_id"],
-                    "quality": progress.get("quality", "good")
-                }
+        if db is None:
+            logger.error("MongoDB not connected - cannot get download progress")
+            return None
+            
+        progress = db.download_progress.find_one({"user_id": user_id})
+        if progress:
+            logger.info(f"Found download progress for user {user_id}: {progress.get('current_index', 0)}/{len(progress.get('videos', []))}")
+            return {
+                "batch_id": progress["batch_id"],
+                "videos": progress["videos"],
+                "current_index": progress["current_index"],
+                "chat_id": progress["chat_id"],
+                "quality": progress.get("quality", "good")
+            }
+        else:
+            logger.warning(f"No download progress found for user {user_id}")
+            return None
     except Exception as e:
         logger.error(f"Error getting download progress: {e}")
-    return None
+        return None
 
 def delete_download_progress(user_id):
     """Delete download progress from MongoDB"""
@@ -918,7 +930,21 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Save download progress to MongoDB with quality
         quality = context.user_data.get('video_quality', 'good')
+        logger.info(f"Saving download progress for user {user_id}: {len(video_list)} videos, quality: {quality}")
         save_download_progress(user_id, batch_id, video_list, 0, query.message.chat_id, quality)
+        
+        # Verify data was saved
+        saved_data = get_download_progress(user_id)
+        if not saved_data:
+            logger.error(f"Failed to save download progress for user {user_id}")
+            await query.edit_message_text(
+                "❌ Error: Could not save download progress.\n\n"
+                "This might be a MongoDB connection issue.\n"
+                "Please try again or contact support."
+            )
+            return
+        
+        logger.info(f"Download progress verified for user {user_id}")
         
         await query.edit_message_text(
             f"✅ Ready to download {len(video_list)} videos!\n\n"
