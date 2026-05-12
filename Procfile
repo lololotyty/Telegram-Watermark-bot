@@ -1,1 +1,1 @@
-worker: sh run.sh
+worker: python Arise.py
