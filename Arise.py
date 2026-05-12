@@ -272,6 +272,62 @@ def delete_user_session(user_id):
     except Exception as e:
         logger.error(f"Error deleting session: {e}")
 
+def save_download_progress(user_id, batch_id, videos, current_index, chat_id):
+    """Save download progress to MongoDB"""
+    try:
+        if db is not None:
+            db.download_progress.update_one(
+                {"user_id": user_id},
+                {
+                    "$set": {
+                        "user_id": user_id,
+                        "batch_id": batch_id,
+                        "videos": videos,
+                        "current_index": current_index,
+                        "chat_id": chat_id,
+                        "updated_at": datetime.utcnow()
+                    }
+                },
+                upsert=True
+            )
+            logger.info(f"Saved download progress for user {user_id}: {current_index}/{len(videos)}")
+    except Exception as e:
+        logger.error(f"Error saving download progress: {e}")
+
+def get_download_progress(user_id):
+    """Get download progress from MongoDB"""
+    try:
+        if db is not None:
+            progress = db.download_progress.find_one({"user_id": user_id})
+            if progress:
+                return {
+                    "batch_id": progress["batch_id"],
+                    "videos": progress["videos"],
+                    "current_index": progress["current_index"],
+                    "chat_id": progress["chat_id"]
+                }
+    except Exception as e:
+        logger.error(f"Error getting download progress: {e}")
+    return None
+
+def delete_download_progress(user_id):
+    """Delete download progress from MongoDB"""
+    try:
+        if db is not None:
+            db.download_progress.delete_one({"user_id": user_id})
+            logger.info(f"Deleted download progress for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error deleting download progress: {e}")
+
+def is_download_active(user_id):
+    """Check if user has active download"""
+    try:
+        if db is not None:
+            return db.download_progress.find_one({"user_id": user_id}) is not None
+    except Exception as e:
+        logger.error(f"Error checking download status: {e}")
+    return False
+
 def add_download_task(user_id, chat_id, batch_id, videos):
     """Add videos to download queue"""
     try:
