@@ -1114,28 +1114,6 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
              f"✅ Download progress cleaned from database.\n\n"
              f"Use /batches to download from another batch."
     )
-            )
-        except Exception as e:
-            logger.error(f"Error processing video {video_name}: {e}")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Error processing video {i+1}/{len(videos)}\n\n"
-                     f"📹 {video_name}\n\n"
-                     f"Error: {str(e)[:200]}\n\n"
-                     f"Continuing with next video..."
-            )
-        
-        # Small delay between videos
-        time.sleep(2)
-    
-    # All videos processed
-    delete_download_progress(user_id)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🎉 All videos processed!\n\n"
-             f"Total: {len(videos)} videos\n\n"
-             f"Use /batches to download from another batch."
-    )
 
 async def stop_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stop the download process"""
