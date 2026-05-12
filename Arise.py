@@ -1111,9 +1111,25 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                     
                     # Start yt-dlp with progress output and quality selection
                     # For DASH (.mpd) files, we need special handling
+                    
+                    # Determine format based on quality and file type
+                    is_dash = '.mpd' in video_url.lower()
+                    
+                    if is_dash:
+                        # For DASH manifests, use simpler format selection
+                        if quality == 'best':
+                            format_str = 'bv*+ba/b'  # Best video + best audio
+                        elif quality == 'low':
+                            format_str = 'wv*[height<=480]+wa/w[height<=480]/bv*[height<=480]+ba/b[height<=480]'
+                        else:  # good (default)
+                            format_str = 'wv*[height<=720]+wa/w[height<=720]/bv*[height<=720]+ba/b[height<=720]'
+                    else:
+                        # For direct MP4 files, use original format
+                        format_str = format_option
+                    
                     yt_dlp_cmd = [
                         'yt-dlp',
-                        '-f', format_option,  # Use quality-based format
+                        '-f', format_str,
                         '-o', raw_output,
                         '--newline',  # Output progress on new lines
                         '--no-warnings',
@@ -1126,9 +1142,10 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                     ]
                     
                     # For DASH (.mpd) files, add external downloader
-                    if '.mpd' in video_url.lower():
+                    if is_dash:
                         yt_dlp_cmd.insert(1, '--external-downloader')
                         yt_dlp_cmd.insert(2, 'ffmpeg')
+                        logger.info(f"Using DASH format: {format_str} with FFmpeg external downloader")
                     
                     process = subprocess.Popen(
                         yt_dlp_cmd,
@@ -1182,16 +1199,57 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                     
                     if result_code != 0:
                         logger.warning(f"yt-dlp stderr: {stderr_output[:500]}")
-                    
-                    if result_code != 0:
-                        await status_msg.edit_text(
-                            f"❌ Failed to download video {i+1}/{len(videos)}\n\n"
-                            f"📹 {video_name}\n\n"
-                            f"Error: {stderr_output[:200]}\n\n"
-                            f"Skipping to next video..."
-                        )
-                        time.sleep(2)
-                        continue
+                        
+                        # Try fallback with simpler format for DASH files
+                        if is_dash and 'Requested format is not available' in stderr_output:
+                            logger.info("Retrying with fallback format: best")
+                            await status_msg.edit_text(
+                                f"⚠️ Format not available, retrying with different settings...\n\n"
+                                f"📹 {video_name}\n\n"
+                                f"⏳ Please wait..."
+                            )
+                            
+                            # Retry with simplest format
+                            fallback_cmd = [
+                                'yt-dlp',
+                                '--external-downloader', 'ffmpeg',
+                                '-f', 'best',
+                                '-o', raw_output,
+                                '--no-warnings',
+                                '--merge-output-format', 'mp4',
+                                '--no-check-certificates',
+                                video_url
+                            ]
+                            
+                            fallback_result = subprocess.run(
+                                fallback_cmd,
+                                capture_output=True,
+                                text=True,
+                                timeout=1800
+                            )
+                            
+                            if fallback_result.returncode != 0:
+                                logger.error(f"Fallback also failed: {fallback_result.stderr[:500]}")
+                                await status_msg.edit_text(
+                                    f"❌ Failed to download video {i+1}/{len(videos)}\n\n"
+                                    f"📹 {video_name}\n\n"
+                                    f"Error: Format not available\n\n"
+                                    f"Skipping to next video..."
+                                )
+                                time.sleep(2)
+                                continue
+                            else:
+                                logger.info("Fallback download successful!")
+                                result_code = 0  # Mark as success
+                        else:
+                            await status_msg.edit_text(
+                                f"❌ Failed to download video {i+1}/{len(videos)}\n\n"
+                                f"📹 {video_name}\n\n"
+                                f"Error: {stderr_output[:200]}\n\n"
+                                f"Skipping to next video..."
+                            )
+                            time.sleep(2)
+                            continue
                     
                     # Check if file exists
                     if not os.path.exists(raw_output):
