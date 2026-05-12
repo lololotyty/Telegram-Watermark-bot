@@ -4,9 +4,12 @@ import os
 import sys
 import time
 import logging
+import asyncio
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 
 # Load environment variables from .env file (for local development only)
 try:
@@ -26,6 +29,36 @@ SESSION_FILE = "auth_session.json"
 
 # Conversation states for Telegram bot
 EMAIL, PASSWORD = range(2)
+
+# MongoDB Configuration
+MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb://localhost:27017/')
+mongo_client = None
+db = None
+
+def init_mongodb():
+    """Initialize MongoDB connection"""
+    global mongo_client, db
+    try:
+        mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        # Test connection
+        mongo_client.admin.command('ping')
+        db = mongo_client['arise_bot']
+        logger.info("✅ MongoDB connected successfully")
+        
+        # Create indexes
+        db.download_queue.create_index([("user_id", 1), ("status", 1)])
+        db.user_sessions.create_index("user_id", unique=True)
+        
+        return True
+    except ConnectionFailure as e:
+        logger.error(f"❌ MongoDB connection failed: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ MongoDB initialization error: {e}")
+        return False
+
+# Store user sessions in memory (fallback if MongoDB fails)
+user_sessions_memory = {}
 
 HEADERS = {
     "Host": "api.arisemedicalacademy.com",
@@ -194,11 +227,187 @@ class AriseHarvester:
         print(f"    Master File: {master_file}\n")
 
 # ============================================
-# TELEGRAM BOT FUNCTIONALITY
+# MONGODB HELPER FUNCTIONS
 # ============================================
 
-# Store user sessions in memory
-user_sessions = {}
+def save_user_session(user_id, email, token):
+    """Save user session to MongoDB"""
+    try:
+        if db is not None:
+            db.user_sessions.update_one(
+                {"user_id": user_id},
+                {"$set": {
+                    "user_id": user_id,
+                    "email": email,
+                    "token": token,
+                    "updated_at": datetime.utcnow()
+                }},
+                upsert=True
+            )
+        else:
+            user_sessions_memory[user_id] = {"email": email, "token": token}
+    except Exception as e:
+        logger.error(f"Error saving session: {e}")
+        user_sessions_memory[user_id] = {"email": email, "token": token}
+
+def get_user_session(user_id):
+    """Get user session from MongoDB"""
+    try:
+        if db is not None:
+            session = db.user_sessions.find_one({"user_id": user_id})
+            if session:
+                return {"email": session["email"], "token": session["token"]}
+        return user_sessions_memory.get(user_id)
+    except Exception as e:
+        logger.error(f"Error getting session: {e}")
+        return user_sessions_memory.get(user_id)
+
+def delete_user_session(user_id):
+    """Delete user session from MongoDB"""
+    try:
+        if db is not None:
+            db.user_sessions.delete_one({"user_id": user_id})
+        if user_id in user_sessions_memory:
+            del user_sessions_memory[user_id]
+    except Exception as e:
+        logger.error(f"Error deleting session: {e}")
+
+def add_download_task(user_id, chat_id, batch_id, videos):
+    """Add videos to download queue"""
+    try:
+        if db is None:
+            return False
+        
+        # Add each video as a separate task
+        tasks = []
+        for idx, video in enumerate(videos):
+            task = {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "batch_id": batch_id,
+                "video_index": idx,
+                "total_videos": len(videos),
+                "video_name": video['name'],
+                "video_url": video['url'],
+                "video_id": video['id'],
+                "status": "pending",  # pending, processing, completed, failed, stopped
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+                "retry_count": 0
+            }
+            tasks.append(task)
+        
+        if tasks:
+            db.download_queue.insert_many(tasks)
+            logger.info(f"Added {len(tasks)} videos to download queue for user {user_id}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error adding download tasks: {e}")
+        return False
+
+def get_pending_tasks(limit=1):
+    """Get pending download tasks"""
+    try:
+        if db is None:
+            return []
+        
+        tasks = list(db.download_queue.find(
+            {"status": "pending"},
+            sort=[("created_at", 1)]
+        ).limit(limit))
+        
+        return tasks
+    except Exception as e:
+        logger.error(f"Error getting pending tasks: {e}")
+        return []
+
+def update_task_status(task_id, status, error_message=None):
+    """Update task status"""
+    try:
+        if db is None:
+            return
+        
+        update_data = {
+            "status": status,
+            "updated_at": datetime.utcnow()
+        }
+        
+        if error_message:
+            update_data["error_message"] = error_message
+        
+        if status == "failed":
+            db.download_queue.update_one(
+                {"_id": task_id},
+                {
+                    "$set": update_data,
+                    "$inc": {"retry_count": 1}
+                }
+            )
+        else:
+            db.download_queue.update_one(
+                {"_id": task_id},
+                {"$set": update_data}
+            )
+    except Exception as e:
+        logger.error(f"Error updating task status: {e}")
+
+def get_user_queue_status(user_id):
+    """Get user's download queue status"""
+    try:
+        if db is None:
+            return None
+        
+        total = db.download_queue.count_documents({"user_id": user_id})
+        pending = db.download_queue.count_documents({"user_id": user_id, "status": "pending"})
+        processing = db.download_queue.count_documents({"user_id": user_id, "status": "processing"})
+        completed = db.download_queue.count_documents({"user_id": user_id, "status": "completed"})
+        failed = db.download_queue.count_documents({"user_id": user_id, "status": "failed"})
+        stopped = db.download_queue.count_documents({"user_id": user_id, "status": "stopped"})
+        
+        return {
+            "total": total,
+            "pending": pending,
+            "processing": processing,
+            "completed": completed,
+            "failed": failed,
+            "stopped": stopped
+        }
+    except Exception as e:
+        logger.error(f"Error getting queue status: {e}")
+        return None
+
+def stop_user_downloads(user_id):
+    """Stop all pending downloads for a user"""
+    try:
+        if db is None:
+            return 0
+        
+        result = db.download_queue.update_many(
+            {"user_id": user_id, "status": {"$in": ["pending", "processing"]}},
+            {"$set": {"status": "stopped", "updated_at": datetime.utcnow()}}
+        )
+        
+        return result.modified_count
+    except Exception as e:
+        logger.error(f"Error stopping downloads: {e}")
+        return 0
+
+def clear_user_queue(user_id):
+    """Clear all tasks for a user"""
+    try:
+        if db is None:
+            return 0
+        
+        result = db.download_queue.delete_many({"user_id": user_id})
+        return result.deleted_count
+    except Exception as e:
+        logger.error(f"Error clearing queue: {e}")
+        return 0
+
+# ============================================
+# TELEGRAM BOT FUNCTIONALITY
+# ============================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command - Welcome message"""
@@ -208,6 +417,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/login - Login to your account\n"
         "/batches - View your batches\n"
+        "/status - Check download queue status\n"
+        "/stop - Stop pending downloads\n"
+        "/clear - Clear download queue\n"
         "/logout - Logout from your account\n"
         "/help - Show this message\n\n"
         "Start by using /login to authenticate!"
@@ -255,10 +467,7 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if resp_data.get("status") == "OK":
             token = resp_data.get("result")
-            user_sessions[user_id] = {
-                "email": email,
-                "token": token
-            }
+            save_user_session(user_id, email, token)
             
             await status_msg.edit_text(
                 "✅ *Login Successful!*\n\n"
@@ -298,8 +507,9 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Logout user"""
     user_id = update.effective_user.id
     
-    if user_id in user_sessions:
-        del user_sessions[user_id]
+    session = get_user_session(user_id)
+    if session:
+        delete_user_session(user_id)
         await update.message.reply_text("✅ You have been logged out successfully.")
     else:
         await update.message.reply_text("ℹ️ You are not logged in.")
@@ -308,7 +518,8 @@ async def get_batches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get user's batches"""
     user_id = update.effective_user.id
     
-    if user_id not in user_sessions:
+    session = get_user_session(user_id)
+    if not session:
         await update.message.reply_text(
             "❌ You are not logged in.\n\n"
             "Please use /login first."
@@ -317,7 +528,6 @@ async def get_batches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status_msg = await update.message.reply_text("🔄 Fetching your batches...")
     
-    session = user_sessions[user_id]
     auth_headers = HEADERS.copy()
     auth_headers.update({
         "authorization": f"Bearer {session['token']}",
@@ -357,21 +567,53 @@ async def get_batches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def batch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle batch selection and fetch videos"""
+    """Handle batch selection and ask user for preference"""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
     
-    if user_id not in user_sessions:
+    session = get_user_session(user_id)
+    if not session:
         await query.edit_message_text("❌ Session expired. Please /login again.")
         return
     
     batch_id = query.data.replace("batch_", "")
     
-    await query.edit_message_text(f"🔄 Fetching videos for batch {batch_id}...\n\nThis may take a moment.")
+    # Store batch_id in user context
+    context.user_data['selected_batch'] = batch_id
     
-    session = user_sessions[user_id]
+    # Ask user what they want
+    keyboard = [
+        [InlineKeyboardButton("📋 Get Links Only", callback_data=f"links_{batch_id}")],
+        [InlineKeyboardButton("📥 Download & Upload Videos", callback_data=f"download_{batch_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "📚 What would you like?\n\n"
+        "📋 Get Links Only - Fast, just video URLs\n"
+        "📥 Download & Upload - Bot downloads and uploads videos to Telegram (slower)\n\n"
+        "Choose an option:",
+        reply_markup=reply_markup
+    )
+
+async def links_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle links only request"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    
+    session = get_user_session(user_id)
+    if not session:
+        await query.edit_message_text("❌ Session expired. Please /login again.")
+        return
+    
+    batch_id = query.data.replace("links_", "")
+    
+    await query.edit_message_text(f"🔄 Fetching video links for batch {batch_id}...\n\nThis may take a moment.")
+    
     auth_headers = HEADERS.copy()
     auth_headers.update({
         "authorization": f"Bearer {session['token']}",
@@ -468,6 +710,13 @@ async def batch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=query.message.chat_id,
                 text=f"✅ Download Complete!\n\n"
                      f"Total videos sent: {len(video_links)}\n\n"
+                     f"📥 HOW TO DOWNLOAD:\n"
+                     f"1. Install yt-dlp: pip install yt-dlp\n"
+                     f"2. Run: yt-dlp \"VIDEO_URL\"\n\n"
+                     f"🎥 HOW TO WATCH (No Download):\n"
+                     f"1. Install VLC Player\n"
+                     f"2. Open VLC → Network Stream\n"
+                     f"3. Paste video URL → Play\n\n"
                      f"Use /batches to download from another batch."
             )
         else:
@@ -478,6 +727,457 @@ async def batch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "❌ Error fetching videos.\n\n"
             "Please try again later."
+        )
+
+async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle download and upload request"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    
+    session = get_user_session(user_id)
+    if not session:
+        await query.edit_message_text("❌ Session expired. Please /login again.")
+        return
+    
+    batch_id = query.data.replace("download_", "")
+    
+    await query.edit_message_text(
+        f"📥 Starting download and upload process...\n\n"
+        f"⏳ Fetching video list..."
+    )
+    
+    auth_headers = HEADERS.copy()
+    auth_headers.update({
+        "authorization": f"Bearer {session['token']}",
+        "useremail": session['email']
+    })
+    
+    try:
+        # Fetch recorded classes
+        resp = requests.get(
+            f"{BASE_URL}/liveclass/getRecordedClasses/{batch_id}",
+            headers=auth_headers,
+            timeout=30
+        )
+        data = resp.json().get("result")
+        
+        all_videos = []
+        if isinstance(data, list):
+            all_videos = data
+        elif isinstance(data, dict):
+            for subj in data:
+                if isinstance(data[subj], list):
+                    all_videos.extend(data[subj])
+        
+        if not all_videos:
+            await query.edit_message_text("ℹ️ No recorded videos found in this batch.")
+            return
+        
+        await query.edit_message_text(
+            f"📹 Found {len(all_videos)} videos.\n\n"
+            f"⏳ Fetching video URLs..."
+        )
+        
+        # Fetch video details
+        video_list = []
+        for i, item in enumerate(all_videos):
+            c_id = str(item.get('recordedClassId'))
+            if not c_id:
+                continue
+            
+            det_url = f"{BASE_URL}/liveclass/getRecordedClassDetails/{batch_id}?recordedClassId={c_id}"
+            try:
+                det_resp = requests.get(det_url, headers=auth_headers, timeout=10)
+                det_data = det_resp.json().get("result", {})
+                
+                stream_url = det_data.get("streamUrl", "N/A")
+                class_name = item.get('recordedClassName', 'Unknown Video')
+                
+                if stream_url != "N/A":
+                    video_list.append({
+                        'name': class_name,
+                        'url': stream_url,
+                        'id': c_id
+                    })
+                
+                if (i + 1) % 10 == 0:
+                    await query.edit_message_text(
+                        f"📹 Fetching URLs...\n\n"
+                        f"Progress: {i + 1}/{len(all_videos)}"
+                    )
+                
+            except Exception as e:
+                logger.error(f"Error fetching video {c_id}: {e}")
+                continue
+        
+        if not video_list:
+            await query.edit_message_text("❌ Could not fetch video URLs.")
+            return
+        
+        # Save download progress to MongoDB
+        save_download_progress(user_id, batch_id, video_list, 0, query.message.chat_id)
+        
+        await query.edit_message_text(
+            f"✅ Ready to download {len(video_list)} videos!\n\n"
+            f"📥 Starting download and upload process...\n"
+            f"⏳ This will take time. Videos will be uploaded one by one.\n\n"
+            f"💡 Send /stop to stop the download process anytime.\n"
+            f"💡 Progress is saved - if bot restarts, it will resume from where it stopped."
+        )
+        
+        # Start downloading and uploading
+        await download_and_upload_videos(context, user_id)
+        
+    except Exception as e:
+        logger.error(f"Download process error: {e}")
+        await query.edit_message_text(
+            "❌ Error starting download process.\n\n"
+            "Please try again later."
+        )
+
+async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Download videos using yt-dlp and upload to Telegram with proper metadata"""
+    import subprocess
+    import tempfile
+    import ffmpeg
+    from PIL import Image
+    
+    download_data = get_download_progress(user_id)
+    if not download_data:
+        return
+    
+    videos = download_data['videos']
+    chat_id = download_data['chat_id']
+    
+    for i in range(download_data['current_index'], len(videos)):
+        # Check if user stopped the process
+        if not is_download_active(user_id):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⏹️ Download process stopped by user."
+            )
+            # Clean up completed download from MongoDB
+            delete_download_progress(user_id)
+            return
+        
+        video = videos[i]
+        video_name = video['name'].replace('/', '-').replace('\\', '-').replace(':', '-')
+        video_url = video['url']
+        
+        # Update current index in MongoDB
+        save_download_progress(user_id, download_data['batch_id'], videos, i, chat_id)
+        
+        try:
+            # Send status
+            status_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"📥 Downloading video {i+1}/{len(videos)}...\n\n"
+                     f"📹 {video_name}\n\n"
+                     f"⏳ Please wait, this may take several minutes..."
+            )
+            
+            # Create temporary directory
+            with tempfile.TemporaryDirectory() as temp_dir:
+                raw_output = os.path.join(temp_dir, f"raw_{video_name}.mp4")
+                output_file = os.path.join(temp_dir, f"{video_name}.mp4")
+                thumbnail_file = os.path.join(temp_dir, f"{video_name}_thumb.jpg")
+                
+                # Check if it's a PDF
+                is_pdf = video_url.lower().endswith('.pdf')
+                
+                if is_pdf:
+                    # Download PDF
+                    result = subprocess.run(
+                        ['yt-dlp', '-o', output_file, video_url],
+                        capture_output=True,
+                        text=True,
+                        timeout=1800
+                    )
+                    
+                    if result.returncode != 0 or not os.path.exists(output_file):
+                        await status_msg.edit_text(
+                            f"❌ Failed to download PDF {i+1}/{len(videos)}\n\n"
+                            f"📄 {video_name}\n\n"
+                            f"Skipping to next item..."
+                        )
+                        time.sleep(2)
+                        continue
+                    
+                    # Upload PDF
+                    file_size = os.path.getsize(output_file)
+                    file_size_mb = file_size / (1024 * 1024)
+                    
+                    if file_size_mb > 50:  # Telegram limit for documents
+                        await status_msg.edit_text(
+                            f"⚠️ PDF {i+1}/{len(videos)} is too large ({file_size_mb:.1f} MB)\n\n"
+                            f"📄 {video_name}\n\n"
+                            f"Telegram limit is 50MB for documents. Skipping..."
+                        )
+                        continue
+                    
+                    await status_msg.edit_text(
+                        f"📤 Uploading PDF {i+1}/{len(videos)}...\n\n"
+                        f"📄 {video_name}\n"
+                        f"📊 Size: {file_size_mb:.1f} MB"
+                    )
+                    
+                    with open(output_file, 'rb') as pdf_file:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=pdf_file,
+                            caption=f"📄 {video_name}\n\nDocument {i+1}/{len(videos)}",
+                            read_timeout=300,
+                            write_timeout=300
+                        )
+                    
+                    await status_msg.edit_text(
+                        f"✅ PDF {i+1}/{len(videos)} uploaded successfully!\n\n"
+                        f"📄 {video_name}"
+                    )
+                    
+                else:
+                    # Download video using yt-dlp
+                    result = subprocess.run(
+                        ['yt-dlp', '-o', raw_output, video_url],
+                        capture_output=True,
+                        text=True,
+                        timeout=1800  # 30 minutes timeout
+                    )
+                    
+                    if result.returncode != 0:
+                        await status_msg.edit_text(
+                            f"❌ Failed to download video {i+1}/{len(videos)}\n\n"
+                            f"📹 {video_name}\n\n"
+                            f"Error: {result.stderr[:200]}\n\n"
+                            f"Skipping to next video..."
+                        )
+                        time.sleep(2)
+                        continue
+                    
+                    # Check if file exists
+                    if not os.path.exists(raw_output):
+                        await status_msg.edit_text(
+                            f"❌ Video file not found after download: {video_name}\n\n"
+                            f"Skipping to next video..."
+                        )
+                        continue
+                    
+                    await status_msg.edit_text(
+                        f"🔧 Processing video {i+1}/{len(videos)}...\n\n"
+                        f"📹 {video_name}\n\n"
+                        f"⏳ Adding metadata and generating thumbnail..."
+                    )
+                    
+                    # Get video info
+                    try:
+                        probe = ffmpeg.probe(raw_output)
+                        video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+                        duration = float(probe['format'].get('duration', 0))
+                        width = int(video_info.get('width', 0))
+                        height = int(video_info.get('height', 0))
+                    except:
+                        duration = 0
+                        width = 0
+                        height = 0
+                    
+                    # Generate thumbnail from first few seconds
+                    try:
+                        (
+                            ffmpeg
+                            .input(raw_output, ss=5)  # Take frame at 5 seconds
+                            .filter('scale', 320, -1)  # Scale to 320px width
+                            .output(thumbnail_file, vframes=1)
+                            .overwrite_output()
+                            .run(capture_stdout=True, capture_stderr=True, quiet=True)
+                        )
+                        
+                        # Verify thumbnail was created
+                        if not os.path.exists(thumbnail_file):
+                            # Try at 0 seconds if 5 seconds failed
+                            (
+                                ffmpeg
+                                .input(raw_output, ss=0)
+                                .filter('scale', 320, -1)
+                                .output(thumbnail_file, vframes=1)
+                                .overwrite_output()
+                                .run(capture_stdout=True, capture_stderr=True, quiet=True)
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to generate thumbnail: {e}")
+                        thumbnail_file = None
+                    
+                    # Fix metadata if missing
+                    if duration == 0 or width == 0 or height == 0:
+                        try:
+                            # Re-encode with proper metadata
+                            (
+                                ffmpeg
+                                .input(raw_output)
+                                .output(output_file, codec='copy', movflags='faststart')
+                                .overwrite_output()
+                                .run(capture_stdout=True, capture_stderr=True, quiet=True)
+                            )
+                            
+                            # Get updated info
+                            probe = ffmpeg.probe(output_file)
+                            video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+                            duration = float(probe['format'].get('duration', 0))
+                            width = int(video_info.get('width', 0))
+                            height = int(video_info.get('height', 0))
+                        except Exception as e:
+                            logger.warning(f"Failed to fix metadata: {e}")
+                            # Use raw file if processing failed
+                            output_file = raw_output
+                    else:
+                        # Just copy if metadata is fine
+                        output_file = raw_output
+                    
+                    # Get file size
+                    file_size = os.path.getsize(output_file)
+                    file_size_mb = file_size / (1024 * 1024)
+                    
+                    # Telegram has 2GB limit for bots
+                    if file_size_mb > 2000:
+                        await status_msg.edit_text(
+                            f"⚠️ Video {i+1}/{len(videos)} is too large ({file_size_mb:.1f} MB)\n\n"
+                            f"📹 {video_name}\n\n"
+                            f"Telegram limit is 2GB. Skipping...\n\n"
+                            f"💡 Use link instead: {video_url}"
+                        )
+                        continue
+                    
+                    # Upload to Telegram
+                    await status_msg.edit_text(
+                        f"📤 Uploading video {i+1}/{len(videos)}...\n\n"
+                        f"📹 {video_name}\n"
+                        f"📊 Size: {file_size_mb:.1f} MB\n"
+                        f"⏱️ Duration: {int(duration//60)}:{int(duration%60):02d}\n\n"
+                        f"⏳ Please wait..."
+                    )
+                    
+                    with open(output_file, 'rb') as video_file:
+                        # Prepare thumbnail
+                        thumb = None
+                        if thumbnail_file and os.path.exists(thumbnail_file):
+                            thumb = open(thumbnail_file, 'rb')
+                        
+                        try:
+                            await context.bot.send_video(
+                                chat_id=chat_id,
+                                video=video_file,
+                                thumbnail=thumb,
+                                caption=f"📹 {video_name}\n\nVideo {i+1}/{len(videos)}",
+                                duration=int(duration) if duration > 0 else None,
+                                width=width if width > 0 else None,
+                                height=height if height > 0 else None,
+                                supports_streaming=True,
+                                read_timeout=300,
+                                write_timeout=300
+                            )
+                        finally:
+                            if thumb:
+                                thumb.close()
+                    
+                    await status_msg.edit_text(
+                        f"✅ Video {i+1}/{len(videos)} uploaded successfully!\n\n"
+                        f"📹 {video_name}"
+                    )
+                
+        except subprocess.TimeoutExpired:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⏱️ Download timeout for video {i+1}/{len(videos)}\n\n"
+                     f"📹 {video_name}\n\n"
+                     f"Video took too long to download. Skipping..."
+            )
+        except Exception as e:
+            logger.error(f"Error processing video {video_name}: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error processing video {i+1}/{len(videos)}\n\n"
+                     f"📹 {video_name}\n\n"
+                     f"Error: {str(e)[:200]}\n\n"
+                     f"Continuing with next video..."
+            )
+        
+        # Small delay between videos
+        time.sleep(2)
+    
+    # All videos processed - clean up from MongoDB
+    delete_download_progress(user_id)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🎉 All videos processed!\n\n"
+             f"Total: {len(videos)} videos\n\n"
+             f"✅ Download progress cleaned from database.\n\n"
+             f"Use /batches to download from another batch."
+    )
+            )
+        except Exception as e:
+            logger.error(f"Error processing video {video_name}: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error processing video {i+1}/{len(videos)}\n\n"
+                     f"📹 {video_name}\n\n"
+                     f"Error: {str(e)[:200]}\n\n"
+                     f"Continuing with next video..."
+            )
+        
+        # Small delay between videos
+        time.sleep(2)
+    
+    # All videos processed
+    delete_download_progress(user_id)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🎉 All videos processed!\n\n"
+             f"Total: {len(videos)} videos\n\n"
+             f"Use /batches to download from another batch."
+    )
+
+async def stop_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop the download process"""
+    user_id = update.effective_user.id
+    
+    if is_download_active(user_id):
+        delete_download_progress(user_id)
+        await update.message.reply_text(
+            "⏹️ Download process stopped.\n\n"
+            "Progress has been cleared from database.\n\n"
+            "Use /batches to start a new download."
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ No active download process.\n\n"
+            "Use /batches to start downloading videos."
+        )
+
+async def resume_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resume interrupted download"""
+    user_id = update.effective_user.id
+    
+    download_data = get_download_progress(user_id)
+    if download_data:
+        videos = download_data['videos']
+        current = download_data['current_index']
+        remaining = len(videos) - current
+        
+        await update.message.reply_text(
+            f"📥 Found interrupted download!\n\n"
+            f"Batch: {download_data['batch_id']}\n"
+            f"Progress: {current}/{len(videos)} videos\n"
+            f"Remaining: {remaining} videos\n\n"
+            f"Resuming download..."
+        )
+        
+        # Resume downloading
+        await download_and_upload_videos(context, user_id)
+    else:
+        await update.message.reply_text(
+            "ℹ️ No interrupted download found.\n\n"
+            "Use /batches to start a new download."
         )
 
 def run_telegram_bot():
@@ -509,7 +1209,11 @@ def run_telegram_bot():
     application.add_handler(login_handler)
     application.add_handler(CommandHandler("logout", logout))
     application.add_handler(CommandHandler("batches", get_batches))
+    application.add_handler(CommandHandler("stop", stop_download))
+    application.add_handler(CommandHandler("resume", resume_download))
     application.add_handler(CallbackQueryHandler(batch_callback, pattern="^batch_"))
+    application.add_handler(CallbackQueryHandler(links_callback, pattern="^links_"))
+    application.add_handler(CallbackQueryHandler(download_callback, pattern="^download_"))
     
     # Start the bot
     logger.info("🤖 Arise Academy Telegram Bot started!")
