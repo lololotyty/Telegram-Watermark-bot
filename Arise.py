@@ -1127,6 +1127,9 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                         # For direct MP4 files, use original format
                         format_str = format_option
                     
+                    # Get user session for authentication
+                    user_session = get_user_session(user_id)
+                    
                     yt_dlp_cmd = [
                         'yt-dlp',
                         '-f', format_str,
@@ -1138,14 +1141,32 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                         '--http-chunk-size', '10M',  # Download in 10MB chunks
                         '--merge-output-format', 'mp4',  # Ensure MP4 output
                         '--no-check-certificates',  # Skip SSL verification if needed
-                        video_url
                     ]
+                    
+                    # Add authentication headers if available
+                    if user_session:
+                        yt_dlp_cmd.extend([
+                            '--add-header', f'authorization:Bearer {user_session["token"]}',
+                            '--add-header', f'useremail:{user_session["email"]}'
+                        ])
+                    
+                    # Add common headers
+                    yt_dlp_cmd.extend([
+                        '--add-header', 'User-Agent:Mozilla/5.0 (Linux; Android 16; Pixel 10 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36',
+                        '--add-header', 'Referer:https://localhost/',
+                        '--add-header', 'Origin:https://localhost'
+                    ])
+                    
+                    # Add video URL
+                    yt_dlp_cmd.append(video_url)
                     
                     # For DASH (.mpd) files, add external downloader
                     if is_dash:
                         yt_dlp_cmd.insert(1, '--external-downloader')
                         yt_dlp_cmd.insert(2, 'ffmpeg')
                         logger.info(f"Using DASH format: {format_str} with FFmpeg external downloader")
+                    
+                    logger.info(f"yt-dlp command: {' '.join([c if 'Bearer' not in c else 'Bearer ***' for c in yt_dlp_cmd])}")
                     
                     process = subprocess.Popen(
                         yt_dlp_cmd,
@@ -1202,24 +1223,34 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                         
                         # Try fallback with simpler format for DASH files
                         if is_dash and 'Requested format is not available' in stderr_output:
-                            logger.info("Retrying with fallback format: best")
+                            logger.info("Retrying with fallback: no format specification")
                             await status_msg.edit_text(
-                                f"⚠️ Format not available, retrying with different settings...\n\n"
+                                f"⚠️ Format not available, retrying with automatic format...\n\n"
                                 f"📹 {video_name}\n\n"
                                 f"⏳ Please wait..."
                             )
                             
-                            # Retry with simplest format
+                            # Try 1: No format specification at all (let yt-dlp decide)
                             fallback_cmd = [
                                 'yt-dlp',
                                 '--external-downloader', 'ffmpeg',
-                                '-f', 'best',
                                 '-o', raw_output,
                                 '--no-warnings',
                                 '--merge-output-format', 'mp4',
                                 '--no-check-certificates',
-                                video_url
                             ]
+                            
+                            # Add authentication headers to fallback
+                            if user_session:
+                                fallback_cmd.extend([
+                                    '--add-header', f'authorization:Bearer {user_session["token"]}',
+                                    '--add-header', f'useremail:{user_session["email"]}'
+                                ])
+                            
+                            fallback_cmd.extend([
+                                '--add-header', 'User-Agent:Mozilla/5.0 (Linux; Android 16; Pixel 10 Pro) AppleWebKit/537.36',
+                                video_url
+                            ])
                             
                             fallback_result = subprocess.run(
                                 fallback_cmd,
@@ -1229,17 +1260,87 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                             )
                             
                             if fallback_result.returncode != 0:
-                                logger.error(f"Fallback also failed: {fallback_result.stderr[:500]}")
-                                await status_msg.edit_text(
-                                    f"❌ Failed to download video {i+1}/{len(videos)}\n\n"
-                                    f"📹 {video_name}\n\n"
-                                    f"Error: Format not available\n\n"
-                                    f"Skipping to next video..."
+                                logger.error(f"Fallback 1 failed: {fallback_result.stderr[:500]}")
+                                
+                                # Try 2: Use --allow-unplayable-formats
+                                logger.info("Retrying with --allow-unplayable-formats")
+                                fallback_cmd2 = [
+                                    'yt-dlp',
+                                    '--external-downloader', 'ffmpeg',
+                                    '--allow-unplayable-formats',
+                                    '-o', raw_output,
+                                    '--no-warnings',
+                                    '--merge-output-format', 'mp4',
+                                    '--no-check-certificates',
+                                ]
+                                
+                                # Add authentication headers
+                                if user_session:
+                                    fallback_cmd2.extend([
+                                        '--add-header', f'authorization:Bearer {user_session["token"]}',
+                                        '--add-header', f'useremail:{user_session["email"]}'
+                                    ])
+                                
+                                fallback_cmd2.extend([
+                                    '--add-header', 'User-Agent:Mozilla/5.0 (Linux; Android 16; Pixel 10 Pro) AppleWebKit/537.36',
+                                    video_url
+                                ])
+                                
+                                fallback_result2 = subprocess.run(
+                                    fallback_cmd2,
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=1800
                                 )
-                                time.sleep(2)
-                                continue
+                                
+                                if fallback_result2.returncode != 0:
+                                    logger.error(f"Fallback 2 also failed: {fallback_result2.stderr[:500]}")
+                                    
+                                    # Try 3: Direct download with ffmpeg (bypass yt-dlp format selection)
+                                    logger.info("Trying direct FFmpeg download")
+                                    ffmpeg_cmd = [
+                                        'ffmpeg',
+                                        '-user_agent', 'Mozilla/5.0 (Linux; Android 16; Pixel 10 Pro) AppleWebKit/537.36',
+                                    ]
+                                    
+                                    # Add authentication headers for FFmpeg
+                                    if user_session:
+                                        ffmpeg_cmd.extend([
+                                            '-headers', f'authorization: Bearer {user_session["token"]}\r\nuseremail: {user_session["email"]}\r\n'
+                                        ])
+                                    
+                                    ffmpeg_cmd.extend([
+                                        '-i', video_url,
+                                        '-c', 'copy',
+                                        '-y',
+                                        raw_output
+                                    ])
+                                    
+                                    ffmpeg_result = subprocess.run(
+                                        ffmpeg_cmd,
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=1800
+                                    )
+                                    
+                                    if ffmpeg_result.returncode != 0:
+                                        logger.error(f"FFmpeg direct download failed: {ffmpeg_result.stderr[:500]}")
+                                        await status_msg.edit_text(
+                                            f"❌ Failed to download video {i+1}/{len(videos)}\n\n"
+                                            f"📹 {video_name}\n\n"
+                                            f"Error: All download methods failed\n\n"
+                                            f"Skipping to next video..."
+                                        )
+                                        time.sleep(2)
+                                        continue
+                                    else:
+                                        logger.info("FFmpeg direct download successful!")
+                                        result_code = 0
+                                else:
+                                    logger.info("Fallback 2 successful!")
+                                    result_code = 0
                             else:
-                                logger.info("Fallback download successful!")
+                                logger.info("Fallback 1 successful!")
                                 result_code = 0  # Mark as success
                         else:
                             await status_msg.edit_text(
