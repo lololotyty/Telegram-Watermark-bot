@@ -1088,22 +1088,29 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                     logger.info(f"Starting yt-dlp download for: {video_name}")
                     logger.info(f"Video URL: {video_url}")
                     
-                    # Create progress file for yt-dlp
-                    progress_file = os.path.join(temp_dir, "progress.txt")
-                    
                     # Start yt-dlp with progress output and quality selection
+                    # For DASH (.mpd) files, we need special handling
+                    yt_dlp_cmd = [
+                        'yt-dlp',
+                        '-f', format_option,  # Use quality-based format
+                        '-o', raw_output,
+                        '--newline',  # Output progress on new lines
+                        '--no-warnings',
+                        '--concurrent-fragments', '4',  # Download 4 fragments at once
+                        '--buffer-size', '16K',  # Increase buffer
+                        '--http-chunk-size', '10M',  # Download in 10MB chunks
+                        '--merge-output-format', 'mp4',  # Ensure MP4 output
+                        '--no-check-certificates',  # Skip SSL verification if needed
+                        video_url
+                    ]
+                    
+                    # For DASH (.mpd) files, add external downloader
+                    if '.mpd' in video_url.lower():
+                        yt_dlp_cmd.insert(1, '--external-downloader')
+                        yt_dlp_cmd.insert(2, 'ffmpeg')
+                    
                     process = subprocess.Popen(
-                        [
-                            'yt-dlp',
-                            '-f', format_option,  # Quality format
-                            '-o', raw_output,
-                            '--newline',  # Output progress on new lines
-                            '--no-warnings',
-                            '--concurrent-fragments', '4',  # Download 4 fragments at once
-                            '--buffer-size', '16K',  # Increase buffer
-                            '--http-chunk-size', '10M',  # Download in 10MB chunks
-                            video_url
-                        ],
+                        yt_dlp_cmd,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
@@ -1148,18 +1155,18 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                     # Wait for process to complete
                     process.wait()
                     result_code = process.returncode
+                    stderr_output = process.stderr.read()
                     
                     logger.info(f"yt-dlp exit code: {result_code}")
                     
                     if result_code != 0:
-                        stderr = process.stderr.read()
-                        logger.warning(f"yt-dlp stderr: {stderr[:500]}")
+                        logger.warning(f"yt-dlp stderr: {stderr_output[:500]}")
                     
                     if result_code != 0:
                         await status_msg.edit_text(
                             f"❌ Failed to download video {i+1}/{len(videos)}\n\n"
                             f"📹 {video_name}\n\n"
-                            f"Error: {result.stderr[:200]}\n\n"
+                            f"Error: {stderr_output[:200]}\n\n"
                             f"Skipping to next video..."
                         )
                         time.sleep(2)
