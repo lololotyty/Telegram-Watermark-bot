@@ -1377,6 +1377,14 @@ def run_telegram_bot():
         print("Please set it in Heroku Config Vars or your environment.\n")
         return
     
+    # Initialize MongoDB
+    logger.info("Initializing MongoDB connection...")
+    mongodb_connected = init_mongodb()
+    if mongodb_connected:
+        logger.info("MongoDB initialization successful")
+    else:
+        logger.warning("⚠️ Bot will run without MongoDB (limited functionality)")
+    
     # Create application
     application = Application.builder().token(TOKEN).build()
     
