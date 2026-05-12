@@ -5,6 +5,7 @@ import sys
 import time
 import logging
 import asyncio
+import re
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
@@ -1112,11 +1113,82 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                     # Get user session for authentication
                     user_session = get_user_session(user_id)
                     
-                    # For DASH manifests, try direct approach first
+                    # Try to extract direct MP4 URL from DASH manifest URL
+                    direct_mp4_url = None
+                    if '.mpd' in video_url.lower() and 'amazons3/arise-vod-content' in video_url:
+                        # Extract the S3 path from the URL
+                        # From: https://.../_definst_/mp4:amazons3/arise-vod-content/prod/xxx/file_720.mp4/manifest.mpd
+                        # To: https://arise-vod-content.s3.amazonaws.com/prod/xxx/file_720.mp4
+                        try:
+                            import re
+                            match = re.search(r'amazons3/arise-vod-content/(.+?)\.mp4', video_url)
+                            if match:
+                                s3_path = match.group(1)
+                                direct_mp4_url = f"https://arise-vod-content.s3.amazonaws.com/{s3_path}.mp4"
+                                logger.info(f"Extracted direct MP4 URL: {direct_mp4_url}")
+                        except Exception as e:
+                            logger.warning(f"Could not extract direct MP4 URL: {e}")
+                    
+                    # Try direct MP4 download first if we have the URL
+                    result_code = 1
+                    if direct_mp4_url:
+                        logger.info("Trying direct MP4 download from S3...")
+                        await status_msg.edit_text(
+                            f"📥 Downloading video {i+1}/{len(videos)}...\n\n"
+                            f"📹 {video_name}\n\n"
+                            f"⏳ Downloading from S3..."
+                        )
+                        
+                        # Use requests to download with progress
+                        try:
+                            auth_headers = HEADERS.copy()
+                            if user_session:
+                                auth_headers.update({
+                                    "authorization": f"Bearer {user_session['token']}",
+                                    "useremail": user_session['email']
+                                })
+                            
+                            response = requests.get(direct_mp4_url, headers=auth_headers, stream=True, timeout=30)
+                            
+                            if response.status_code == 200:
+                                total_size = int(response.headers.get('content-length', 0))
+                                downloaded = 0
+                                last_update_time = time.time()
+                                
+                                with open(raw_output, 'wb') as f:
+                                    for chunk in response.iter_content(chunk_size=1024*1024):  # 1MB chunks
+                                        if chunk:
+                                            f.write(chunk)
+                                            downloaded += len(chunk)
+                                            
+                                            # Update progress every 5 seconds
+                                            current_time = time.time()
+                                            if total_size > 0 and current_time - last_update_time >= 5:
+                                                percent = (downloaded / total_size) * 100
+                                                progress_bar = '█' * int(percent / 5) + '░' * (20 - int(percent / 5))
+                                                await status_msg.edit_text(
+                                                    f"📥 Downloading video {i+1}/{len(videos)}\n\n"
+                                                    f"📹 {video_name}\n\n"
+                                                    f"Progress: [{progress_bar}] {percent:.1f}%\n"
+                                                    f"⏳ Please wait..."
+                                                )
+                                                last_update_time = current_time
+                                
+                                if os.path.exists(raw_output) and os.path.getsize(raw_output) > 0:
+                                    logger.info("Direct MP4 download successful!")
+                                    result_code = 0
+                                else:
+                                    logger.warning("Direct MP4 download failed - file empty")
+                            else:
+                                logger.warning(f"Direct MP4 download failed with status {response.status_code}")
+                        except Exception as e:
+                            logger.warning(f"Direct MP4 download error: {e}")
+                    
+                    # If direct MP4 failed, try DASH with FFmpeg
                     is_dash = '.mpd' in video_url.lower()
                     
-                    if is_dash:
-                        logger.info("DASH manifest detected - trying direct FFmpeg download first")
+                    if result_code != 0 and is_dash:
+                        logger.info("Trying FFmpeg DASH download...")
                         
                         # Build FFmpeg command with authentication
                         ffmpeg_cmd = [
@@ -1132,20 +1204,18 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                         ffmpeg_cmd.extend([
                             '-i', video_url,
                             '-c', 'copy',
-                            '-bsf:a', 'aac_adtstoasc',  # Fix AAC stream
-                            '-movflags', '+faststart',  # Optimize for streaming
+                            '-bsf:a', 'aac_adtstoasc',
+                            '-movflags', '+faststart',
                             '-y',
                             raw_output
                         ])
                         
-                        logger.info("Trying direct FFmpeg download...")
                         await status_msg.edit_text(
                             f"📥 Downloading video {i+1}/{len(videos)}...\n\n"
                             f"📹 {video_name}\n\n"
-                            f"⏳ Using direct download method..."
+                            f"⏳ Using DASH download..."
                         )
                         
-                        # Try FFmpeg first
                         ffmpeg_process = subprocess.Popen(
                             ffmpeg_cmd,
                             stdout=subprocess.PIPE,
@@ -1154,7 +1224,6 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                             bufsize=1
                         )
                         
-                        # Monitor FFmpeg progress
                         last_update_time = time.time()
                         while True:
                             line = ffmpeg_process.stderr.readline()
@@ -1162,7 +1231,6 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                                 break
                             
                             if line and 'time=' in line:
-                                # Update every 5 seconds
                                 current_time = time.time()
                                 if current_time - last_update_time >= 5:
                                     await status_msg.edit_text(
@@ -1176,14 +1244,11 @@ async def download_and_upload_videos(context: ContextTypes.DEFAULT_TYPE, user_id
                         result_code = ffmpeg_process.returncode
                         
                         if result_code == 0 and os.path.exists(raw_output):
-                            logger.info("FFmpeg direct download successful!")
+                            logger.info("FFmpeg DASH download successful!")
                         else:
-                            logger.warning(f"FFmpeg failed with code {result_code}, trying yt-dlp...")
-                            result_code = 1  # Mark as failed to trigger yt-dlp fallback
-                    else:
-                        result_code = 1  # Not DASH, use yt-dlp
+                            logger.warning(f"FFmpeg failed with code {result_code}")
                     
-                    # If FFmpeg failed or not DASH, try yt-dlp
+                    # If both failed, try yt-dlp as last resort
                     if result_code != 0:
                         # Determine format based on quality and file type
                         if is_dash:
