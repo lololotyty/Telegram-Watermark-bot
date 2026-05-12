@@ -38,23 +38,44 @@ db = None
 def init_mongodb():
     """Initialize MongoDB connection"""
     global mongo_client, db
+    
+    # Log the MongoDB URI (hide password)
+    if MONGODB_URI:
+        safe_uri = MONGODB_URI.split('@')[1] if '@' in MONGODB_URI else 'localhost'
+        logger.info(f"🔄 Attempting MongoDB connection to: {safe_uri}")
+    else:
+        logger.error("❌ MONGODB_URI environment variable not set!")
+        return False
+    
     try:
-        mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        logger.info("🔄 Creating MongoDB client...")
+        mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000)
+        
+        logger.info("🔄 Testing MongoDB connection with ping...")
         # Test connection
         mongo_client.admin.command('ping')
-        db = mongo_client['arise_bot']
-        logger.info("✅ MongoDB connected successfully")
         
+        logger.info("🔄 Selecting database 'arise_bot'...")
+        db = mongo_client['arise_bot']
+        
+        logger.info("🔄 Creating indexes...")
         # Create indexes
         db.download_queue.create_index([("user_id", 1), ("status", 1)])
         db.user_sessions.create_index("user_id", unique=True)
         
+        logger.info("✅ MongoDB connected successfully!")
+        logger.info(f"✅ Database: {db.name}")
+        logger.info(f"✅ Collections: {db.list_collection_names()}")
+        
         return True
     except ConnectionFailure as e:
-        logger.error(f"❌ MongoDB connection failed: {e}")
+        logger.error(f"❌ MongoDB ConnectionFailure: {e}")
+        logger.error(f"❌ Check if MongoDB URI is correct and network is accessible")
         return False
     except Exception as e:
-        logger.error(f"❌ MongoDB initialization error: {e}")
+        logger.error(f"❌ MongoDB initialization error: {type(e).__name__}: {e}")
+        import traceback
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
         return False
 
 # Store user sessions in memory (fallback if MongoDB fails)
